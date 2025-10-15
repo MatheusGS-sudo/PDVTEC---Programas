@@ -1,0 +1,54 @@
+//Necessário colocar dentro do teste_mirage.php5 e rodar via web e não CLI
+$_cod_loja = 1;
+
+$arquivo = 'cpfs.txt';
+$handle = fopen($arquivo, 'r');
+
+if (!$handle) {
+    die("Erro ao abrir o arquivo de CPFs.\n");
+}
+
+$total = 0;
+$totalFalha = 0;
+
+while (($linha = fgets($handle)) !== false) {
+
+    $cpf = trim($linha);
+
+    if (empty($cpf)) {
+        continue;
+    }
+
+    echo "Processando CPF: $cpf\n";
+
+    try {
+        $cliente = new cliente_bluesoft($GLOBALS['_MASTER']);
+
+        // Captura o retorno da função
+        $resultado = $cliente->buscarECadastrarCliente($_cod_loja, $cpf);
+
+        // Verifica se o retorno está vazio
+        if (empty($resultado)) {
+            echo " CPF $cpf retornou vazio da API Bluesoft.\n";
+            file_put_contents("clientes_falha.txt", "$cpf\n", FILE_APPEND);
+            $totalFalha++;
+        } else {
+            echo " Cliente $cpf processado com sucesso.\n";
+            $total++;
+        }
+
+    } catch (Exception $e) {
+        echo " Erro ao processar CPF $cpf: " . $e->getMessage() . "\n";
+        file_put_contents("clientes_falha.txt", "$cpf | " . $e->getMessage() . "\n", FILE_APPEND);
+        $totalFalha++;
+    }
+
+    // Pequena pausa entre requisições para evitar bloqueio da API
+    usleep(300000);
+}
+
+echo "\nImportação finalizada.\n";
+echo " Total de clientes processados com sucesso: $total\n";
+echo " Total de clientes com falha/vazio: $totalFalha\n";
+
+fclose($handle);
