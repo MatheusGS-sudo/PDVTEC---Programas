@@ -1,0 +1,168 @@
+<?php
+date_default_timezone_set('America/Sao_Paulo');
+
+$test_product_id = '';
+$db_host = '';   
+$db_port = '';    
+$db_name = ''; 
+$db_user = '';    
+$db_pass = '';      
+$db_table = 'tab_mercadoria_tipo_venda'; 
+$produto_key_column = 'cod_mercadoria'; 
+$preco_column = 'preco_unitario';      
+$loja_column = 'cod_loja';             
+// -----------------------------------------------------------
+$log_filename = 'atualizacoes.zlg'; 
+
+$_token = 'TokenNFCe'; 
+
+$loja_alvo = cod_loja;
+$base_url = "Pathing da API";
+
+$_header = [
+    "Content-Type: application/json",
+    "X-Customtoken: {$_token}"
+];
+
+try {
+    $dsn = "pgsql:host={$db_host};port={$db_port};dbname={$db_name};options='--client_encoding=UTF8'";
+    $pdo = new PDO($dsn, $db_user, $db_pass);
+    echo "Conexão com o banco de dados estabelecida com sucesso.\n";
+} catch (PDOException $e) {
+    die("Erro ao conectar com o banco de dados: " . $e->getMessage());
+}
+$produtos_nulos = [];
+$total_produtos = 0;
+$params = [':loja' => $loja_alvo];
+
+if (!empty($test_product_id)) {
+    echo "\nModo de TESTE ATIVO: Consultando apenas o Produto ID: {$test_product_id}...\n";
+    // No modo de teste, a query ignora se o preço ? NULL para permitir re-teste
+    $sql_select = "SELECT {$produto_key_column} FROM {$db_table} WHERE {$produto_key_column} = :id AND {$loja_column} = :loja";
+    $params[':id'] = $test_product_id;
+} else {
+    echo "\nModo de PRODUÇÃO: Consultando produtos com preço NULL na Loja {$loja_alvo}...\n";
+    // Modo normal: busca todos com preço NULL
+    $sql_select = "SELECT {$produto_key_column} FROM {$db_table} WHERE {$preco_column} IS NULL AND {$loja_column} = :loja";
+}
+
+try {
+    $stmt_select = $pdo->prepare($sql_select);
+    // Executa com os parâmetros ajustados (incluindo :id no modo de teste)
+    $stmt_select->execute($params); 
+    $produtos_nulos = $stmt_select->fetchAll(PDO::FETCH_COLUMN, 0); 
+} catch (PDOException $e) {
+    die("Erro ao consultar produtos no banco: " . $e->getMessage());
+}
+
+$total_produtos = count($produtos_nulos);
+
+if ($total_produtos === 0) {
+    $mensagem = empty($test_product_id) 
+        ? "Nenhum produto encontrado com preço NULL para a Loja {$loja_alvo}. Processo finalizado."
+        : "O Produto ID {$test_product_id} n?o foi encontrado na Loja {$loja_alvo}. Processo finalizado.";
+    die($mensagem . "\n");
+}
+
+echo "-> Encontrados {$total_produtos} produtos para processar.\n";
+
+if (empty($test_product_id)) {
+    echo "Você deseja consultar a API e realizar o UPDATE para todos os {$total_produtos} produtos? (sim/nao): ";
+    $handle = fopen("php://stdin", "r");
+    $line = trim(fgets($handle));
+    
+    if (strtolower($line) !== 'sim') {
+        die("Processo de atualização cancelado pelo usuário.\n");
+    }
+}
+
+echo "Iniciando a consulta e atualização...\n\n";
+
+$produtos_atualizados = 0;
+
+foreach ($produtos_nulos as $produto_id_com_zeros) {
+    
+    // **TRATAMENTO DO ID PARA A API:**
+    $produto_id_api = ltrim($produto_id_com_zeros, '0');
+    
+    $url_completa = "{$base_url}/{$produto_id_api}/precos";
+    
+    echo "--- Processando Produto ID: {$produto_id_com_zeros} (API ID: {$produto_id_api}) ---\n";
+    
+    // --- Lógica cURL para Obter Dados ---
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url_completa);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, $_header);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    
+    $response = curl_exec($ch);
+    
+    if (curl_errno($ch)) {
+        echo '  -> Erro cURL: ' . curl_error($ch) . "\n";
+    } else {
+        $data = json_decode($response, true);
+        $preco_para_atualizar = null;
+
+        // --- Lógica para extrair o preço da Loja alvo ---
+        if ($data !== null && isset($data['precos'])) {
+            
+            foreach ($data['precos'] as $preco_loja) {
+                if (isset($preco_loja['lojaKey']) && $preco_loja['lojaKey'] == $loja_alvo) {
+                    
+                    $preco_cru = isset($preco_loja['precoNormal']) ? (float)$preco_loja['precoNormal'] : 0.00;
+                    
+                    if ($preco_cru > 0) {
+                        $preco_para_atualizar = $preco_cru;
+                    }
+                    break; 
+                }
+            }
+            
+            if ($preco_para_atualizar === null) {
+                echo "  -> Preço (Loja {$loja_alvo}) n?o encontrado ou ? zero. Nenhuma atualização será feita.\n";
+            }
+            
+        } else {
+            echo "  -> Erro na resposta da API para este produto (ID: {$produto_id_api}). Pulando...\n";
+        }
+        
+        if ($preco_para_atualizar !== null) {
+            $sql_update = "UPDATE {$db_table} SET {$preco_column} = :preco, data_ultima_alteracao = DATE_TRUNC('second', NOW()) WHERE {$produto_key_column} = :id AND {$loja_column} = :loja";
+            
+            try {
+                $stmt_update = $pdo->prepare($sql_update);
+                $stmt_update->execute([
+                    ':preco' => $preco_para_atualizar,
+                    ':id' => $produto_id_com_zeros, 
+                    ':loja' => $loja_alvo
+                ]);
+                
+                if ($stmt_update->rowCount() > 0) {
+                    $preco_formatado = number_format($preco_para_atualizar, 2, ',', '.');
+                    echo "  -> **SUCESSO**: Preço atualizado para R$ " . $preco_formatado . " no banco.\n";
+                    $produtos_atualizados++;
+                    
+                    // Log da atualização
+                    $log_line = date('Y-m-d H:i:s') . 
+                                " | SUCESSO |Loja: {$loja_alvo}| Produto: {$produto_id_com_zeros} | API ID: {$produto_id_api} | Pre?o: R$ {$preco_formatado}\n";
+                    file_put_contents($log_filename, $log_line, FILE_APPEND);
+                } else {
+                    echo "  -> **AVISO**: Produto não encontrado ou já atualizado na tabela (row count 0).\n";
+                }
+            } catch (PDOException $e) {
+                echo "  -> **ERRO NO BANCO**: Falha ao atualizar o preço: " . $e->getMessage() . "\n";
+            }
+        }
+    }
+    
+    curl_close($ch);
+    echo "----------------------------------------\n\n";
+}
+echo "****************************************************\n";
+echo "RELATÓRIO FINAL:\n";
+echo "Total de produtos consultados (com pre?o NULL): {$total_produtos}\n";
+echo "Total de produtos ATUALIZADOS com sucesso: {$produtos_atualizados}\n";
+echo "****************************************************\n";
+
+?>
